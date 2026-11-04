@@ -1,0 +1,72 @@
+name: "Auto: announce data"
+
+# 이 파일의 원본은 navi-core 의 scripts/release-repo/announce-data.yml 입니다.
+# 업데이트 저장소(`<제품>-release`)의 `.github/workflows/announce-data.yml` 에 그대로 복사합니다.
+#
+# `data-<데이터 버전>` 초안을 사람이 공개하면 자동으로 실행합니다.
+# 그 릴리스의 `data.json` 과 `data.json.sig` 로 `current` 의 같은 파일을 교체합니다.
+# 앱은 `current` 의 목록을 보고 데이터를 받으므로, 교체하는 순간 교사에게 나갑니다.
+# 서명은 `Publish: data` 가 이미 했으므로 시크릿이 필요 없습니다.
+on:
+  release:
+    types: [published]
+
+# 실행 중인 작업을 끊지 않습니다. 기다리는 작업은 하나뿐이라, 여럿을 잇따라 공개하면 하나가 취소될 수 있습니다.
+# 그때는 Actions 에서 취소된 실행을 다시 실행합니다.
+concurrency:
+  group: announce-data
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Replace the index in current
+        run: |
+          set -eu
+          # `current` 자신이나 다른 릴리스가 공개되어도 할 일이 없습니다.
+          if ! printf '%s' "$TAG" | grep -Eq '^data-[0-9]{8}$'; then
+            echo "· '$TAG' is not a data release."
+            exit 0
+          fi
+          VERSION=${TAG#data-}
+
+          mkdir new old
+          gh release download "$TAG" --dir new --pattern data.json --pattern data.json.sig
+          test "$(wc -c < new/data.json.sig)" -eq 64
+          # 목록이 가리키는 릴리스가 방금 공개한 그 릴리스인지 확인합니다.
+          test "$(node -p 'require("./new/data.json").tag')" = "$TAG"
+
+          if gh release view current >/dev/null 2>&1; then
+            # 옛 초안을 나중에 공개해도 교사의 데이터를 낮은 버전으로 되돌리지 않습니다.
+            # 사람이 하는 되돌리기는 파일을 `current` 에 직접 올립니다.
+            if gh release view current --json assets --jq '.assets[].name' | grep -qx data.json; then
+              gh release download current --dir old --pattern data.json
+              NOW=$(node -p 'require("./old/data.json").version')
+              printf '%s' "$NOW" | grep -Eq '^[0-9]{8}$'
+              if [ "$VERSION" -lt "$NOW" ]; then
+                echo "::warning::current already has $NOW — $VERSION is not announced."
+                exit 0
+              fi
+            fi
+          else
+            gh release create current --title current \
+              --notes "Automated — do not edit. The app reads these files to check for updates." \
+              --latest=false
+          fi
+
+          # 서명 → 목록 차례로 하나씩 올립니다. 실패하면 이 실행을 다시 실행합니다.
+          gh release upload current new/data.json.sig --clobber
+          gh release upload current new/data.json --clobber
+          # 앱이 만든 `current` 가 초안이면 교사의 앱이 읽지 못합니다. 초안을 공개한 것이 곧 내보내는 일이므로 함께 공개합니다.
+          if [ "$(gh release view current --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit current --draft=false --latest=false
+          fi
+          gh release edit "$TAG" --latest
+          echo "· current now points to $TAG."
